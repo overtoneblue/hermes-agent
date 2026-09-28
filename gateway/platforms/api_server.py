@@ -3229,17 +3229,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             offset = requested_limit = -1
         if offset < 0 or (requested_limit is not None and requested_limit < 0):
             return _error_response("limit and offset must be non-negative integers", 400, code="invalid_pagination")
+        # Deduped display reads: archived (compaction) rows are still the
+        # user's visible history; display clients opt in to page through them.
+        include_compacted = _coerce_request_bool(request.query.get("include_compacted"))
         default_page = requested_limit is None
         latest_page = order == "latest" or (order is None and default_page)
         limit = 500 if default_page else min(requested_limit, 500)
         messages = await asyncio.to_thread(
-            db.get_messages, resolved_id, limit=limit, offset=offset, latest=latest_page)
+            db.get_messages, resolved_id, limit=limit, offset=offset, latest=latest_page,
+            include_compacted=include_compacted)
         return web.json_response({
             "object": "list", "session_id": resolved_id,
             "data": [self._message_response(m) for m in messages],
             "pagination": {
                 "limit": limit, "offset": offset,
                 "order": order or ("latest" if default_page else "oldest"),
+                "include_compacted": include_compacted,
                 "returned": len(messages)}})
 
     @_require_auth
