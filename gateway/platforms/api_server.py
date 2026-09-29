@@ -3252,7 +3252,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "pagination": {
                 "limit": limit, "offset": offset,
                 "order": order or ("latest" if default_page else "oldest"),
-                "include_compacted": include_compacted,
                 "returned": len(messages)}})
 
     @_require_auth
