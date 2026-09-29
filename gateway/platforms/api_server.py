@@ -1145,6 +1145,14 @@ class _SessionEventQueue:
                 self.loop.call_soon_threadsafe(self.queue.put_nowait, event)
 
 
+async def _discard_stream_events(queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]") -> None:
+    """Drain SSE events for a run whose client disconnected (bounded memory until
+    the run's ``None`` done-sentinel lands). See ``_handle_session_chat_stream``."""
+    while True:
+        if (await queue.get()) is None:
+            return
+
+
 def _room_grant_delegate(name: str):
     """Adapter method forwarding to ``api_server_room_grants.<name>`` (looked up at call time so
     test patches on that module take effect) with this module's error/profile bindings."""
@@ -3673,9 +3681,18 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 name, payload = item
                 await response.write(_sse_frame(payload, event=name, ensure_ascii=False))
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            await self._drain_session_stream_task_on_disconnect(
-                run_id, task, interrupt_message="SSE client disconnected", shield_wait=False)
-            logger.info("Session SSE client disconnected; interrupted live run %s", run_id)
+            if ctx["body"].get("keep_run_on_disconnect") is True:
+                # Opt-in (Atlas-style relays): a dropped stream must not end the turn --
+                # the run persists (transcript + run record) and clients re-attach.
+                # Without this, a relay restart or a phone sleeping mid-turn reads as an
+                # abandoned run and stamps a bare "Operation interrupted." placeholder.
+                if not task.done():
+                    self._track_background_task(asyncio.create_task(_discard_stream_events(queue)))
+                logger.info("Session SSE client disconnected; run %s continues detached", run_id)
+            else:
+                await self._drain_session_stream_task_on_disconnect(
+                    run_id, task, interrupt_message="SSE client disconnected", shield_wait=False)
+                logger.info("Session SSE client disconnected; interrupted live run %s", run_id)
         except asyncio.CancelledError:
             await self._drain_session_stream_task_on_disconnect(
                 run_id, task, interrupt_message="SSE task cancelled", shield_wait=True)
