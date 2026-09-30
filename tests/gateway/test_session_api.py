@@ -556,6 +556,88 @@ async def test_session_chat_stream_disconnect_keeps_run_when_opted_in(
     assert adapter._run_statuses[run_id].get("status") == "completed"
 
 
+def test_stored_session_runtime_reads_switch_write_through(adapter):
+    """The /model switch persists provider/base_url/api_mode on the row — read them back."""
+    session = {"model_config": json.dumps({
+        "model": "anthropic/claude-fable-5.1", "provider": "openrouter",
+        "base_url": "https://openrouter.ai/api/v1", "api_mode": "chat_completions",
+    })}
+    assert adapter._stored_session_runtime(session) == {
+        "provider": "openrouter", "base_url": "https://openrouter.ai/api/v1",
+        "api_mode": "chat_completions",
+    }
+
+
+def test_stored_session_runtime_falls_back_to_gateway_runtime(adapter):
+    session = {"model_config": json.dumps({"gateway_runtime": {
+        "provider": "openrouter", "base_url": "https://openrouter.ai/api/v1",
+    }})}
+    runtime = adapter._stored_session_runtime(session)
+    assert runtime is not None and runtime["provider"] == "openrouter"
+
+
+def test_stored_session_runtime_skips_fallback_activated_runtime(adapter):
+    """A fallback-activated runtime must not become a session's standing route."""
+    session = {"model_config": json.dumps({"gateway_runtime": {
+        "provider": "deepseek", "fallback_active": True,
+    }})}
+    assert adapter._stored_session_runtime(session) is None
+
+
+def test_stored_session_runtime_none_without_provider(adapter):
+    assert adapter._stored_session_runtime({"model_config": None}) is None
+    assert adapter._stored_session_runtime({}) is None
+    assert adapter._stored_session_runtime(
+        {"model_config": json.dumps({"provider": ""})}) is None
+
+
+def test_select_agent_runtime_honors_persisted_provider(adapter):
+    """A persisted cross-provider model must resolve the persisted provider, not the
+    default one (half-applied /model: model switched, route stayed behind → 400)."""
+    runtime_kwargs = {"provider": "deepseek", "base_url": "https://api.deepseek.com/v1"}
+    with patch.object(adapter, "_session_model_override_for", return_value=None), \
+         patch.object(adapter, "_apply_provider_runtime", return_value=True) as apply_mock:
+        model, session_override, request_model, request_provider = adapter._select_agent_runtime(
+            runtime_kwargs, "deepseek-flash",
+            requested_model=None, requested_provider=None, route=None,
+            session_model="anthropic/claude-fable-5.1",
+            session_runtime={"provider": "openrouter", "base_url": "https://openrouter.ai/api/v1",
+                             "api_mode": "chat_completions"},
+            confirmed_runtime_lock=False, gateway_session_key=None, session_id="sess-1")
+    assert model == "anthropic/claude-fable-5.1"
+    apply_mock.assert_called_once()
+    assert apply_mock.call_args[0][1] == "openrouter"
+
+
+def test_select_agent_runtime_pins_persisted_provider_when_resolution_fails(adapter):
+    """Credential re-resolution failure must still pin the persisted route — fail on the
+    right provider instead of silently mixing the foreign model id into the default."""
+    runtime_kwargs = {"provider": "deepseek"}
+    with patch.object(adapter, "_session_model_override_for", return_value=None), \
+         patch.object(adapter, "_apply_provider_runtime", return_value=False):
+        adapter._select_agent_runtime(
+            runtime_kwargs, "deepseek-flash",
+            requested_model=None, requested_provider=None, route=None,
+            session_model="anthropic/claude-fable-5.1",
+            session_runtime={"provider": "openrouter", "base_url": "https://openrouter.ai/api/v1"},
+            confirmed_runtime_lock=False, gateway_session_key=None, session_id="sess-1")
+    assert runtime_kwargs["provider"] == "openrouter"
+    assert runtime_kwargs["base_url"] == "https://openrouter.ai/api/v1"
+
+
+def test_select_agent_runtime_keeps_default_provider_without_persisted(adapter):
+    """No persisted runtime on the row → unchanged behavior (default provider resolution)."""
+    runtime_kwargs = {"provider": "deepseek"}
+    with patch.object(adapter, "_session_model_override_for", return_value=None), \
+         patch.object(adapter, "_apply_provider_runtime", return_value=True) as apply_mock:
+        adapter._select_agent_runtime(
+            runtime_kwargs, "deepseek-flash",
+            requested_model=None, requested_provider=None, route=None,
+            session_model="deepseek-v4-pro", session_runtime=None,
+            confirmed_runtime_lock=False, gateway_session_key=None, session_id="sess-1")
+    assert apply_mock.call_args[0][1] == "deepseek"
+
+
 @pytest.mark.asyncio
 async def test_session_chat_stream_classifies_failed_tool_completions(adapter, session_db):
     session_id = session_db.create_session("tool-status-stream", "api_server")
