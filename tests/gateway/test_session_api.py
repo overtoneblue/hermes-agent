@@ -466,6 +466,97 @@ async def test_session_chat_stream_disconnect_keeps_control_refs_until_executor_
 
 
 @pytest.mark.asyncio
+async def test_session_chat_stream_disconnect_keeps_run_when_opted_in(
+    adapter, session_db
+):
+    """``keep_run_on_disconnect``: a dropped stream must NOT interrupt the run -- it
+    persists and clients re-attach (Atlas relay contract)."""
+    session_id = session_db.create_session("keep-run-stream-session", "api_server")
+    run_started = threading.Event()
+    interrupt_called = threading.Event()
+    allow_finish = threading.Event()
+    write_calls = {"count": 0}
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+
+        def __init__(self, stream_delta_callback):
+            self._stream_delta_callback = stream_delta_callback
+            self.session_id = session_id
+
+        def interrupt(self, _message=None):
+            interrupt_called.set()
+
+        def run_conversation(self, user_message, conversation_history, task_id):
+            del user_message, conversation_history, task_id
+            run_started.set()
+            self._stream_delta_callback("hello")
+            allow_finish.wait(timeout=5)
+            return {"final_response": "done", "session_id": session_id}
+
+    class DisconnectingStreamResponse:
+        async def prepare(self, request):
+            del request
+
+        async def write(self, payload):
+            del payload
+            write_calls["count"] += 1
+            if write_calls["count"] >= 3:
+                raise ConnectionResetError("simulated client disconnect")
+
+    request = MagicMock()
+    request.headers = {}
+    request.match_info = {"session_id": session_id}
+
+    def _create_agent(**kwargs):
+        return FakeAgent(kwargs["stream_delta_callback"])
+
+    with patch.object(
+        adapter,
+        "_get_existing_session_or_404",
+        return_value=({"id": session_id}, None),
+    ), patch.object(
+        adapter,
+        "_read_json_body",
+        return_value=({"message": "stream please", "keep_run_on_disconnect": True}, None),
+    ), patch.object(
+        adapter,
+        "_create_agent",
+        side_effect=_create_agent,
+    ), patch(
+        "gateway.platforms.api_server.web.StreamResponse",
+        return_value=DisconnectingStreamResponse(),
+    ):
+        handler_task = asyncio.create_task(adapter._handle_session_chat_stream(request))
+
+        for _ in range(60):
+            if run_started.is_set():
+                break
+            await asyncio.sleep(0.05)
+
+        assert run_started.is_set()
+        run_id = next(iter(adapter._run_statuses))
+
+        # Handler returns on disconnect; the run must keep going.
+        await asyncio.wait_for(handler_task, timeout=5)
+        assert not interrupt_called.is_set()
+        assert run_id in adapter._active_run_agents
+
+        allow_finish.set()
+        for _ in range(100):
+            if run_id not in adapter._active_run_agents:
+                break
+            await asyncio.sleep(0.05)
+
+    assert not interrupt_called.is_set()
+    # The turn completed normally: refs cleared and the run reached a terminal status.
+    assert run_id not in adapter._active_run_agents
+    assert adapter._run_statuses[run_id].get("status") == "completed"
+
+
+@pytest.mark.asyncio
 async def test_session_chat_stream_classifies_failed_tool_completions(adapter, session_db):
     session_id = session_db.create_session("tool-status-stream", "api_server")
 
